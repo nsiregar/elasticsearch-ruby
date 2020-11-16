@@ -133,7 +133,8 @@ module Elasticsearch
             raise e if count > 9
 
             redo
-          rescue Elasticsearch::Transport::Transport::Errors::BadRequest => e
+          rescue Elasticsearch::Transport::Transport::Errors::BadRequest,
+                 Elasticsearch::Transport::Transport::Errors::Conflict => e
             error = JSON.parse(e.message.gsub(/\[[0-9]{3}\] /, ''))['error']['root_cause'].first
             count += 1
 
@@ -142,6 +143,7 @@ module Elasticsearch
             client.indices.delete(index: error['index']) if error['reason'] =~ /index \[.+\] already exists/
             raise e if count > 9
 
+            sleep(1)
             redo
           end
         end
