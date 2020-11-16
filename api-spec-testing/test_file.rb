@@ -327,10 +327,6 @@ module Elasticsearch
           end
         end
 
-        def clear_datastreams(client)
-          client.xpack.indices.delete_data_stream(name: '*', expand_wildcards: 'all')
-        end
-
         def clear_ml_jobs(client)
           client.xpack.ml.close_job(job_id: '_all', force: true)
           client.xpack.ml.get_jobs['jobs'].each do |d|
@@ -390,6 +386,7 @@ module Elasticsearch
         end
 
         def clear_datastreams(client)
+          client.xpack.indices.delete_data_stream(name: '*', expand_wildcards: 'all')
           client.indices.delete_data_stream(name: '*', expand_wildcards: 'all')
         end
 
@@ -397,10 +394,10 @@ module Elasticsearch
           client.indices.delete(index: '*', expand_wildcards: 'all', ignore: 404)
 
           indices = client.indices.get(index: '_all', expand_wildcards: 'all').keys.reject do |i|
-            i.start_with?('.security') || i.start_with?('.watches') || i.start_with?('.ds-')
+            i.start_with?('.security') || i.start_with?('.watches')
           end
           indices.each do |index|
-            client.indices.delete_alias(index: index, name: '*', ignore: 404)
+            client.indices.delete_alias(index: index, name: '*', ignore: 404) unless index.start_with?('.ds')
             client.indices.delete(index: index, ignore: 404)
           end
         rescue Elasticsearch::Transport::Transport::Errors::BadRequest => e
