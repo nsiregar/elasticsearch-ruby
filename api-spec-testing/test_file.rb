@@ -32,6 +32,7 @@ module Elasticsearch
     # @since 6.2.0
     class TestFile
       attr_reader :features_to_skip, :name, :client
+      LOGGER = Logger.new($stdout)
 
       # Initialize a single test file.
       #
@@ -49,9 +50,8 @@ module Elasticsearch
         begin
           documents = YAML.load_stream(File.new(file_name))
         rescue StandardError => e
-          logger = Logger.new($stdout)
-          logger.error e
-          logger.error "Filename : #{@name}"
+          LOGGER.error e
+          LOGGER.error "Filename : #{@name}"
         end
         @test_definitions = documents.reject { |doc| doc['setup'] || doc['teardown'] }
         @setup = documents.find { |doc| doc['setup'] }
@@ -121,34 +121,41 @@ module Elasticsearch
 
         actions = @setup['setup'].select { |action| action['do'] }.map { |action| Action.new(action['do']) }
         count = 0
+        loop do
+          actions.delete_if do |action|
+            begin
+              action.execute(client)
+              true
+            rescue Elasticsearch::Transport::Transport::Errors::ServiceUnavailable => e
+              # The action sometimes gets the cluster in a recovering state, so we
+              # retry a few times and then raise an exception if it's still
+              # happening
+              count += 1
+              raise e if count > 9
 
-        actions.each do |action|
-          begin
-            action.execute(client)
-          rescue Elasticsearch::Transport::Transport::Errors::ServiceUnavailable => e
-            # The action sometimes gets the cluster in a recovering state, so we
-            # retry a few times and then raise an exception if it's still
-            # happening
-            count += 1
-            raise e if count > 9
-          rescue Elasticsearch::Transport::Transport::Errors::BadRequest,
-                 Elasticsearch::Transport::Transport::Errors::Conflict => e
-            error = JSON.parse(e.message.gsub(/\[[0-9]{3}\] /, ''))['error']['root_cause'].first
-            count += 1
-            raise e if count > 9
+              sleep(1)
+              false
+            rescue Elasticsearch::Transport::Transport::Errors::BadRequest,
+                   Elasticsearch::Transport::Transport::Errors::Conflict => e
+              error = JSON.parse(e.message.gsub(/\[[0-9]{3}\] /, ''))['error']['root_cause'].first
 
-            logger = Logger.new($stdout)
-            logger.error "#{error['type']}: #{error['reason']}"
-            if error['reason'] =~ /index \[.+\] already exists/
-              client.indices.delete(index: error['index'])
-            elsif (model_id_match = /Trained machine learning model \[([a-z0-9-]+)\] already exists/.match(error['reason']))
-              client.ml.delete_trained_model(model_id: model_id_match[1])
+              count += 1
+              raise e if count > 9
+
+              LOGGER.error "#{error['type']}: #{error['reason']}"
+              if error['reason'] =~ /index \[.+\] already exists/
+                LOGGER.info "Attempting to delete index #{error['index']}"
+                LOGGER.info client.indices.delete(index: error['index'], ignore: 404)
+              elsif (model_id_match = /Trained machine learning model \[([a-z0-9-]+)\] already exists/.match(error['reason']))
+                LOGGER.info "Attempting to delete trained model #{model_id_match[1]}"
+                LOGGER.info client.ml.delete_trained_model(model_id: model_id_match[1])
+              end
+              false
             end
-          ensure
-            sleep(1)
-            redo
           end
+          break if actions.empty? # TODO: Add timeout
         end
+
         self
       end
 
@@ -191,15 +198,17 @@ module Elasticsearch
         def wipe_cluster(client)
           if xpack?
             clear_rollup_jobs(client)
-            wait_for_pending_tasks(client)
             clear_sml_policies(client)
+            wait_for_pending_tasks(client)
           end
           clear_snapshots_and_repositories(client)
           clear_datastreams(client) if xpack?
           clear_indices(client)
           if xpack?
-            clear_datafeeds(client)
             clear_templates_xpack(client)
+            clear_datafeeds(client)
+
+            clear_indices(client)
             clear_ml_jobs(client)
           else
             client.indices.delete_template(name: '*')
@@ -213,8 +222,8 @@ module Elasticsearch
           clear_ilm_policies(client)
           clear_auto_follow_patterns(client)
           clear_tasks(client)
-          clear_indices(client)
           clear_transforms(client)
+          wait_for_cluster_tasks(client)
         end
 
         def xpack?
@@ -237,6 +246,24 @@ module Elasticsearch
           end
         end
 
+        def wait_for_cluster_tasks(client)
+          tasks_filter = ['delete-index', 'remove-data-stream']
+          count = 0
+          time = Time.now.to_i
+
+          loop do
+            results = client.cluster.pending_tasks
+            results['tasks'].each do |task|
+              next if task.empty?
+
+              tasks_filter.map do |filter|
+                count += 1 if task['source'].include? filter
+              end
+            end
+            break unless count.positive? && Time.now.to_i < (time + 30)
+          end
+        end
+
         def clear_sml_policies(client)
           policies = client.xpack.snapshot_lifecycle_management.get_lifecycle
 
@@ -253,10 +280,17 @@ module Elasticsearch
         end
 
         def clear_cluster_settings(client)
-          # TODO
-          # settings = client.cluster.get_settings
-          # settings.each do |setting|
-          # end
+          settings = client.cluster.get_settings
+          new_settings = []
+          settings.each do |name, value|
+            next unless !value.empty? && value.is_a?(Array)
+
+            new_settings[name] = [] if new_settings[name].empty?
+            value.each do |key, _v|
+              new_settings[name]["#{key}.*"] = nil
+            end
+          end
+          client.cluster.put_settings(body: new_settings) unless new_settings.empty?
         end
 
         def clear_templates_xpack(client)
@@ -269,7 +303,7 @@ module Elasticsearch
               client.indices.delete_template(name: template)
             rescue Elasticsearch::Transport::Transport::Errors::NotFound => e
               if e.message.include?("index_template [#{template}] missing")
-                client.indices.delete_index_template(name: template)
+                client.indices.delete_index_template(name: template, ignore: 404)
               end
             end
           end
@@ -279,7 +313,7 @@ module Elasticsearch
           result['component_templates'].each do |template|
             next if xpack_template? template['name']
 
-            client.cluster.delete_component_template(name: template['name'])
+            client.cluster.delete_component_template(name: template['name'], ignore: 404)
           end
         end
 
@@ -366,19 +400,19 @@ module Elasticsearch
         end
 
         def clear_snapshots_and_repositories(client)
-          if repositories = client.snapshot.get_repository
-            repositories.keys.each do |repository|
-              responses = client.snapshot.get(repository: repository, snapshot: '_all')['responses']
-              next unless responses
+          return unless (repositories = client.snapshot.get_repository)
 
-              responses.each do |response|
-                response['snapshots'].each do |snapshot|
-                  client.snapshot.delete(repository: repository, snapshot: snapshot['snapshot'])
-                end
+          repositories.each_key do |repository|
+            responses = client.snapshot.get(repository: repository, snapshot: '_all')['responses']
+            next unless responses
+
+            responses.each do |response|
+              response['snapshots'].each do |snapshot|
+                client.snapshot.delete(repository: repository, snapshot: snapshot['snapshot'])
               end
-
-              client.snapshot.delete_repository(repository: repository)
             end
+
+            client.snapshot.delete_repository(repository: repository)
           end
         end
 
@@ -393,7 +427,7 @@ module Elasticsearch
           datastreams['data_streams'].each do |datastream|
             client.xpack.indices.delete_data_stream(name: datastream['name'], expand_wildcards: 'all')
           end
-          client.indices.delete_data_stream(name: '*', expand_wildcards: 'all')
+          client.indices.delete_data_stream(name: '*')
           # It takes some time for datastreams and their indices to get removed,
           # so we're giving this a second:
           sleep(1)
@@ -407,8 +441,7 @@ module Elasticsearch
         end
 
         def clear_indices(client)
-          client.indices.delete(index: '*', expand_wildcards: 'all', ignore: 404)
-
+          client.indices.delete(index: '.ds-ilm-history-*', expand_wildcards: 'open,closed,hidden', ignore: 404)
           indices = client.indices.get(index: '_all', expand_wildcards: 'all').keys.reject do |i|
             i.start_with?('.security') || i.start_with?('.watches')
           end
