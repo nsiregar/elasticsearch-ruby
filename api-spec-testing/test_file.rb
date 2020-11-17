@@ -131,8 +131,6 @@ module Elasticsearch
             # happening
             count += 1
             raise e if count > 9
-
-            redo
           rescue Elasticsearch::Transport::Transport::Errors::BadRequest,
                  Elasticsearch::Transport::Transport::Errors::Conflict => e
             error = JSON.parse(e.message.gsub(/\[[0-9]{3}\] /, ''))['error']['root_cause'].first
@@ -143,10 +141,10 @@ module Elasticsearch
             logger.error "#{error['type']}: #{error['reason']}"
             if error['reason'] =~ /index \[.+\] already exists/
               client.indices.delete(index: error['index'])
-            elsif (model_id_match = /Trained machine learning model \[([a-z-0-9]+)\] already exists/.match(error['reason']))
+            elsif (model_id_match = /Trained machine learning model \[([a-z0-9-]+)\] already exists/.match(error['reason']))
               client.ml.delete_trained_model(model_id: model_id_match[1])
             end
-
+          ensure
             sleep(1)
             redo
           end
@@ -391,8 +389,14 @@ module Elasticsearch
         end
 
         def clear_datastreams(client)
-          client.xpack.indices.delete_data_stream(name: '*', expand_wildcards: 'all')
+          datastreams = client.xpack.indices.get_data_stream(name: '*', expand_wildcards: 'all')
+          datastreams['data_streams'].each do |datastream|
+            client.xpack.indices.delete_data_stream(name: datastream['name'], expand_wildcards: 'all')
+          end
           client.indices.delete_data_stream(name: '*', expand_wildcards: 'all')
+          # It takes some time for datastreams and their indices to get removed,
+          # so we're giving this a second:
+          sleep(1)
         end
 
         def clear_ml_filters(client)
